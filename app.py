@@ -62,16 +62,31 @@ def get_plats():
         return jsonify({"error": "submission_id not found"}), 404
 
     fields = records[0].get("fields", {})
-    raw_cuisines = fields.get(TALLY_CUISINES_FIELD)
-    if not raw_cuisines or not isinstance(raw_cuisines, str):
-        return jsonify({"error": "no cuisine provided on submission"}), 422
 
-    # 2) Normaliser la liste de cuisines (CSV → liste)
-    # ex: "Française,Sud-américaine" → ["Française","Sud-américaine"]
-    cuisines = [c.strip() for c in raw_cuisines.split(",") if c and c.strip()]
-    cuisines = list(dict.fromkeys(cuisines))  # unique, preserve order
+    # 🔧 Le champ multiselect côté Tally (par ex. "Par quel(s) type(s) de cuisine seriez-vous intéressé?")
+    raw_cuisines = fields.get(TALLY_CUISINES_FIELD)
+
+    def _to_cuisine_list(value):
+        # Cas 1 : le champ est un multi-select Airtable → liste de chaînes
+        if isinstance(value, list):
+            return [x.strip() for x in value if isinstance(x, str) and x.strip()]
+        # Cas 2 : le champ est un texte CSV (ex: "Française,Sud-américaine")
+        if isinstance(value, str):
+            return [x.strip() for x in value.split(",") if x and x.strip()]
+        return []
+
+    # Normaliser + dédoublonner en gardant l’ordre
+    seen = set()
+    cuisines = [c for c in _to_cuisine_list(raw_cuisines) if not (c in seen or seen.add(c))]
+
+    # Si aucune cuisine détectée → message d’erreur clair
     if not cuisines:
-        return jsonify({"error": "empty cuisine list"}), 422
+        return jsonify({
+            "error": "no cuisine provided on submission",
+            "field_used": TALLY_CUISINES_FIELD,
+            "raw": raw_cuisines
+        }), 422
+
 
     # 3) Chercher les plats correspondant à AU MOINS une des cuisines choisies
     formula = _build_or_equals(DISHES_CUISINE_FIELD, cuisines)
