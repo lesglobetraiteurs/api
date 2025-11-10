@@ -2,23 +2,41 @@ import os, random
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
+import urllib.parse
 
-AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")
-BASE_ID = os.getenv("AIRTABLE_BASE_ID")
-TALLY_TABLE = os.getenv("AIRTABLE_TALLY_TABLE", "Tally")
-PLATS_TABLE = os.getenv("AIRTABLE_PLATS_TABLE", "Plats")
-ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")  # ex: https://www.lesglobetraiteurs.com
+# ==== ENV ====
+AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")  # pat_...
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")  # appXXXXXXXXXXXX
+AIRTABLE_TALLY_TABLE = os.getenv("AIRTABLE_TALLY_TABLE", "Tally")
+AIRTABLE_DISHES_TABLE = os.getenv("AIRTABLE_DISHES_TABLE", "Dishes")
+ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "https://www.lesglobetraiteurs.com")
+
+# ==== CONST ====
+TALLY_SUBMISSION_FIELD = "Submission ID"
+TALLY_CUISINES_FIELD = "Par quel(s) type(s) de cuisine seriez-vous intéressé?"
+DISHES_CUISINE_FIELD = "Cuisine"
+
+API_BASE = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}"
+HEADERS = {"Authorization": f"Bearer {AIRTABLE_TOKEN}"}
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGIN}})
 
-API_BASE = f"https://api.airtable.com/v0/{BASE_ID}"
-HEADERS = {"Authorization": f"Bearer {AIRTABLE_TOKEN}"}
-
-def airtable_get(table, params=None):
-    r = requests.get(f"{API_BASE}/{table}", headers=HEADERS, params=params or {})
+def _airtable_get(table: str, params: dict):
+    r = requests.get(f"{API_BASE}/{urllib.parse.quote(table)}", headers=HEADERS, params=params or {})
     r.raise_for_status()
     return r.json()
+
+def _escape_airtable_string(s: str) -> str:
+    # Airtable formula: escape single quotes by doubling them
+    return s.replace("'", "''").strip()
+
+def _build_or_equals(field: str, values: list[str]) -> str:
+    # OR({Cuisine}='Française', {Cuisine}='Sud-américaine')
+    parts = [f"{{{field}}}='{_escape_airtable_string(v)}'" for v in values if v]
+    if not parts:
+        return "FALSE()"
+    return f"OR({', '.join(parts)})"
 
 @app.get("/api/health")
 def health():
@@ -26,63 +44,73 @@ def health():
 
 @app.get("/api/get_plats")
 def get_plats():
-    sub_id = request.args.get("submission_id", "").strip()
+    sub_id = (request.args.get("submission_id") or "").strip()
     if not sub_id:
         return jsonify({"error": "missing submission_id"}), 400
 
-    # 1) lire la culture depuis la table Tally
-    params = {"filterByFormula": f"{{submission_id}}='{sub_id}'", "maxRecords": 1}
+    # 1) Lire la soumission Tally → récupérer la(les) cuisine(s)
+    # filterByFormula: {Submission ID}='XYZ'
+    tally_params = {"filterByFormula": f"{{{TALLY_SUBMISSION_FIELD}}}='{_escape_airtable_string(sub_id)}'",
+                    "maxRecords": 1}
     try:
-        tally = airtable_get(TALLY_TABLE, params)
+        tally = _airtable_get(AIRTABLE_TALLY_TABLE, tally_params)
     except requests.HTTPError as e:
         return jsonify({"error": f"Airtable error (Tally): {e}"}), 502
 
-    if not tally.get("records"):
+    records = tally.get("records", [])
+    if not records:
         return jsonify({"error": "submission_id not found"}), 404
 
-    fields = tally["records"][0].get("fields", {})
-    culture = fields.get("culture")
-    if not culture:
-        return jsonify({"error": "culture missing on submission"}), 422
+    fields = records[0].get("fields", {})
+    raw_cuisines = fields.get(TALLY_CUISINES_FIELD)
+    if not raw_cuisines or not isinstance(raw_cuisines, str):
+        return jsonify({"error": "no cuisine provided on submission"}), 422
 
-    # Si culture est single select, on a une string.
-    # Si culture est linked record, Airtable renvoie une liste d'IDs. Dans ce cas,
-    # tu peux stocker aussi le nom dans un champ calculé, OU faire une 2e requête.
-    # Ici on gère deux cas simples :
-    culture_name = None
-    if isinstance(culture, str):
-        culture_name = culture
-        plats_filter = f"{{culture}}='{culture_name}'"
-    elif isinstance(culture, list):
-        # Linked record → on va filtrer par FIND sur le nom stocké en clair.
-        # Suppose qu’un champ rollup/lookup “culture_name” existe sur Tally avec le nom.
-        culture_name = fields.get("culture_name")
-        if not culture_name:
-            return jsonify({"error": "culture_name missing for linked record model"}), 422
-        plats_filter = f"FIND('{culture_name}', ARRAYJOIN({{culture}}))"
+    # 2) Normaliser la liste de cuisines (CSV → liste)
+    # ex: "Française,Sud-américaine" → ["Française","Sud-américaine"]
+    cuisines = [c.strip() for c in raw_cuisines.split(",") if c and c.strip()]
+    cuisines = list(dict.fromkeys(cuisines))  # unique, preserve order
+    if not cuisines:
+        return jsonify({"error": "empty cuisine list"}), 422
 
-    # 2) récupérer les plats pour cette culture
+    # 3) Chercher les plats correspondant à AU MOINS une des cuisines choisies
+    formula = _build_or_equals(DISHES_CUISINE_FIELD, cuisines)
+    dishes_params = {
+        "filterByFormula": formula,
+        "pageSize": 50  # ajustable
+    }
     try:
-        plats_resp = airtable_get(PLATS_TABLE, {"filterByFormula": plats_filter, "pageSize": 50})
+        dishes = _airtable_get(AIRTABLE_DISHES_TABLE, dishes_params)
     except requests.HTTPError as e:
-        return jsonify({"error": f"Airtable error (Plats): {e}"}), 502
+        return jsonify({"error": f"Airtable error (Dishes): {e}"}), 502
 
-    plats_records = plats_resp.get("records", [])
-    if not plats_records:
-        return jsonify({"error": f"No dishes found for culture '{culture_name}'"}), 404
+    dish_records = dishes.get("records", [])
+    if not dish_records:
+        return jsonify({"error": f"No dishes found for cuisines: {', '.join(cuisines)}"}), 404
 
-    # 3) choisir 3 plats au hasard (ou moins si <3)
-    random.shuffle(plats_records)
-    choisis = plats_records[:3]
+    # 4) Tirer au hasard 3 plats
+    random.shuffle(dish_records)
+    picks = dish_records[:3]
 
-    # 4) payload minimal pour le front
+    # 5) Payload : on expose des champs existants (pas d'image dans tes CSV)
     out = []
-    for r in choisis:
+    for r in picks:
         f = r.get("fields", {})
         out.append({
-            "nom": f.get("nom"),
-            "description": f.get("description"),
-            "image_url": f.get("image_url"),
-            "culture": culture_name
+            "Nom du plat": f.get("Nom du plat"),
+            "Cuisine": f.get("Cuisine"),
+            "Type": f.get("Type"),
+            "Régimes (tags)": f.get("Régimes (tags)"),
+            "Allergènes": f.get("Allergènes"),
+            "Prix HT par portion (€)": f.get("Prix HT par portion (€)"),
+            "Nombre de bouchées": f.get("Nombre de bouchées"),
+            "Prestations": f.get("Prestations"),
+            "Sucré/Salé": f.get("Sucré/Salé")
         })
-    return jsonify(out)
+
+    return jsonify({
+        "submission_id": sub_id,
+        "cuisines": cuisines,
+        "count": len(out),
+        "dishes": out
+    })
