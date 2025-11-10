@@ -1,4 +1,4 @@
-fastapi
-uvicorn[standard]
-pyairtable
-python-dotenv
+flask
+flask-cors
+requests
+gunicorn
